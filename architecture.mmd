@@ -1,0 +1,12 @@
+flowchart LR
+  User --> UI[Streamlit UI]
+  UI --> API[FastAPI API]
+  API --> RL[Rate limiter]
+  RL --> Cache[TTL response cache]
+  Cache --> RAG[Retriever]
+  RAG --> Store[(JSON vector index)]
+  RAG --> LLM[OpenAI-compatible LLM adapter]
+  LLM --> Hosted[OpenAI or fallback provider]
+  LLM --> Local[vLLM / Llama or Mistral]
+  API --> Tools[Allow-listed calculator tool]
+  RAG -. ingest .-> Docs[data/*.md and *.txt]
