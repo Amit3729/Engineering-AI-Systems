@@ -1,4 +1,5 @@
 from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -16,14 +17,31 @@ class Source(BaseModel):
     text: str
 
 
+class ToolCall(BaseModel):
+    name: str
+    arguments: Any = None
+    result: Any = None
+
+
 class AssistantResponse(BaseModel):
     answer: str
+    confidence: float = 0.5
+    citations: list[str] = []
     sources: list[Source] = []
-    tool_calls: list[dict[str, Any]] = []
+    tool_calls: list[ToolCall] = []
     provider: str
+    model: str
     cached: bool = False
+    latency_ms: int = 0
 
 
 class IngestResponse(BaseModel):
     documents: int
     chunks: int
+    embedder: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    provider: str
+    index: dict[str, Any]

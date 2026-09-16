@@ -216,4 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-/tests
+.env
+# Project artifacts
+data/chroma/
+.cache/
+tests

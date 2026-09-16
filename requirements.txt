@@ -1,8 +1,21 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pydantic-settings==2.7.1
-openai==1.59.7
+# API
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic-settings==2.15.0
+
+# Model providers (OpenAI-compatible: OpenAI and vLLM)
+openai==3.14.1
 httpx==0.28.1
-numpy==2.2.1
-streamlit==1.41.1
-pytest==8.3.4
+
+# RAG: vector database + ONNX Runtime embeddings
+chromadb==1.5.9
+fastembed==0.7.4
+numpy==2.4.6
+
+# UI
+streamlit==1.64.0
+requests==2.34.2
+
+# Tests
+pytest==9.1.1
+pytest-asyncio==1.4.0

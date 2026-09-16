@@ -1,70 +1,131 @@
+import asyncio
 import hashlib
+import logging
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Any
+
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+
+from .cache import TTLCache
 from .config import get_settings
 from .llm import LLMService
 from .retrieval import Retriever
-from .schemas import AssistantResponse, ChatRequest, IngestResponse, Source
-from .tools import run_tools
+from .schemas import AssistantResponse, ChatRequest, HealthResponse, IngestResponse, Source, ToolCall
+from .tools import ToolRegistry
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 retriever = Retriever(settings)
-llm = LLMService(settings)
-cache: dict[str, tuple[float, AssistantResponse]] = {}
+registry = ToolRegistry(retriever)
+llm = LLMService(settings, registry)
+cache = TTLCache(settings.cache_max_entries, settings.cache_ttl_seconds)
 requests_by_ip: dict[str, deque[float]] = defaultdict(deque)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    retriever.ingest()
+    # Embedding the corpus is CPU work; keep it off the event loop.
+    documents, chunks = await asyncio.to_thread(retriever.ingest)
+    logger.info("index ready: %d documents, %d chunks, embedder=%s", documents, chunks, retriever.embedder.name)
     yield
 
 
-app = FastAPI(title="Engineering AI Assistant", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Engineering AI Assistant", version="2.0.0", lifespan=lifespan)
 
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
-    if request.url.path == "/health":
+    if request.url.path in {"/health", "/docs", "/openapi.json"}:
         return await call_next(request)
+
     now = time.monotonic()
-    bucket = requests_by_ip[request.client.host if request.client else "unknown"]
-    while bucket and bucket[0] <= now - settings.rate_limit_window_seconds:
+    window_start = now - settings.rate_limit_window_seconds
+    client = request.client.host if request.client else "unknown"
+    bucket = requests_by_ip[client]
+    while bucket and bucket[0] <= window_start:
         bucket.popleft()
+
     if len(bucket) >= settings.rate_limit_requests:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded; retry shortly")
+        retry_after = max(1, int(bucket[0] + settings.rate_limit_window_seconds - now))
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded; retry shortly"},
+            headers={"Retry-After": str(retry_after)},
+        )
+
     bucket.append(now)
+    # Drop idle clients so the limiter's own bookkeeping stays bounded.
+    if len(requests_by_ip) > 10_000:
+        for key in [key for key, value in requests_by_ip.items() if not value]:
+            del requests_by_ip[key]
     return await call_next(request)
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "provider": settings.provider}
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    try:
+        index = await asyncio.to_thread(retriever.stats)
+    except Exception as error:  # degraded, not dead
+        index = {"error": str(error)}
+    return HealthResponse(status="ok", provider=settings.provider, index=index | {"cache": cache.stats()})
 
 
 @app.post("/ingest", response_model=IngestResponse)
-def ingest() -> IngestResponse:
-    documents, chunks = retriever.ingest()
-    return IngestResponse(documents=documents, chunks=chunks)
+async def ingest(force: bool = False) -> IngestResponse:
+    documents, chunks = await asyncio.to_thread(retriever.ingest, force)
+    return IngestResponse(documents=documents, chunks=chunks, embedder=retriever.embedder.name)
+
+
+def _merge_sources(*groups: list[dict[str, Any]]) -> list[Source]:
+    """De-duplicate chunks across pre-retrieval and model-issued searches."""
+    best: dict[tuple[str, int], dict[str, Any]] = {}
+    for group in groups:
+        for match in group:
+            key = (match["document"], match["chunk_id"])
+            if key not in best or match["score"] > best[key]["score"]:
+                best[key] = match
+    return [Source(**match) for match in sorted(best.values(), key=lambda item: item["score"], reverse=True)]
 
 
 @app.post("/chat", response_model=AssistantResponse)
 async def chat(request: ChatRequest) -> AssistantResponse:
+    started = time.perf_counter()
     key = hashlib.sha256(f"{request.question}|{request.temperature}|{request.top_p}".encode()).hexdigest()
-    cached = cache.get(key)
-    if cached and cached[0] > time.monotonic():
-        return cached[1].model_copy(update={"cached": True})
-    matches = retriever.search(request.question)
-    sources = [Source(**match) for match in matches if match["score"] > 0]
-    context = "\n".join(f"[{source.document}] {source.text}" for source in sources)
-    tool_calls, tool_context = run_tools(request.question)
+
+    hit = cache.get(key)
+    if hit is not None:
+        return hit.model_copy(update={"cached": True, "latency_ms": int((time.perf_counter() - started) * 1000)})
+
     try:
-        result, provider = await llm.complete(request.question, context, tool_context, request.temperature, request.top_p)
+        matches = await asyncio.to_thread(retriever.search, request.question)
+    except Exception:
+        # Degrade to a context-free answer rather than failing the request.
+        logger.exception("retrieval failed; continuing without pre-retrieved context")
+        matches = []
+
+    prefetched = [match for match in matches if match["score"] >= settings.min_score]
+    context = "\n\n".join(f"[{match['document']}] {match['text']}" for match in prefetched)
+
+    try:
+        completion = await llm.complete(request.question, context, request.temperature, request.top_p)
     except Exception as error:
+        logger.exception("all providers failed")
         raise HTTPException(status_code=503, detail=f"Assistant temporarily unavailable: {error}") from error
-    response = AssistantResponse(answer=str(result.get("answer", "No answer returned.")), sources=sources, tool_calls=tool_calls, provider=provider)
-    cache[key] = (time.monotonic() + settings.cache_ttl_seconds, response)
+
+    response = AssistantResponse(
+        answer=completion.answer,
+        confidence=completion.confidence,
+        citations=completion.citations,
+        sources=_merge_sources(prefetched, completion.retrieved),
+        tool_calls=[ToolCall(**call) for call in completion.tool_calls],
+        provider=completion.provider,
+        model=completion.model,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+    )
+    cache.set(key, response)
     return response

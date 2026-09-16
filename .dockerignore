@@ -1,5 +1,12 @@
 .git
+.gitignore
+.kilo
 __pycache__
+**/__pycache__
 .pytest_cache
+.venv
+venv
 .env
 *.pyc
+data/chroma
+tests

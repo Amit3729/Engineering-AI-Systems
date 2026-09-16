@@ -1,12 +1,44 @@
-flowchart LR
-  User --> UI[Streamlit UI]
-  UI --> API[FastAPI API]
-  API --> RL[Rate limiter]
-  RL --> Cache[TTL response cache]
-  Cache --> RAG[Retriever]
-  RAG --> Store[(JSON vector index)]
-  RAG --> LLM[OpenAI-compatible LLM adapter]
-  LLM --> Hosted[OpenAI or fallback provider]
-  LLM --> Local[vLLM / Llama or Mistral]
-  API --> Tools[Allow-listed calculator tool]
-  RAG -. ingest .-> Docs[data/*.md and *.txt]
+flowchart TB
+    User([User]) --> UI["Streamlit UI<br/>:8501"]
+    UI -->|"POST /chat"| API
+
+    subgraph API["FastAPI service :8000"]
+        direction TB
+        RL["Rate limiter<br/>sliding window per IP → 429 + Retry-After"]
+        Cache["Bounded TTL + LRU response cache<br/>key = question + temperature + top_p"]
+        Pre["Pre-retrieval<br/>top-k chunks above min_score"]
+        Loop["Tool-calling loop<br/>bounded iterations, tools off on final turn"]
+        Merge["Merge + de-duplicate sources<br/>structured JSON response"]
+        RL --> Cache -->|miss| Pre --> Loop --> Merge
+        Cache -->|hit| Merge
+    end
+
+    subgraph RAG["Retrieval"]
+        direction TB
+        Embed["Embeddings<br/>ONNX Runtime · bge-small-en-v1.5 · 384d<br/>(openai | hash alternatives)"]
+        Chroma[("ChromaDB<br/>persistent · HNSW · cosine")]
+        Ingest["Ingestion<br/>paragraph-aware chunks<br/>180 words / 40 overlap<br/>fingerprint skips unchanged corpus"]
+        Docs[/"data/*.md, *.txt"/] --> Ingest --> Embed --> Chroma
+        Embed --> Chroma
+    end
+
+    subgraph Tools["Allow-listed tools"]
+        direction TB
+        T1["search_knowledge_base"]
+        T2["calculator<br/>restricted AST"]
+        T3["current_time"]
+    end
+
+    subgraph Providers["Generation (OpenAI-compatible)"]
+        direction TB
+        Primary["Primary<br/>openai | vllm | local"]
+        Fallback["Fallback provider"]
+        Primary -->|"retry: backoff + jitter<br/>then fail over"| Fallback
+    end
+
+    Pre --> Chroma
+    Loop <-->|"tool_calls / tool results"| Tools
+    T1 --> Chroma
+    Loop <-->|"chat.completions<br/>tools + response_format=json_object"| Providers
+    Primary -.-> vLLM["vLLM server :8001<br/>Llama 3 / Mistral<br/>paged attention + continuous batching"]
+    Merge --> UI
