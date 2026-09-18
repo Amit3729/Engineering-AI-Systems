@@ -15,6 +15,10 @@ class Source(BaseModel):
     chunk_id: int
     score: float
     text: str
+    title: str = ""
+    section: str = ""
+    anchor: str = ""
+    source: str = "root"
 
 
 class ToolCall(BaseModel):

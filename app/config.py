@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     openai_embedding_model: str = "text-embedding-3-small"
     embedding_cache_dir: str = ".cache/fastembed"
+    # Sequences per ONNX forward pass; wider batches cost memory, not throughput.
+    embedding_batch_size: int = 32
 
     # Retrieval
     data_dir: str = "data"
@@ -31,6 +33,10 @@ class Settings(BaseSettings):
     chunk_overlap_words: int = 40
     top_k: int = 4
     min_score: float = 0.15
+    # Chunks embedded and written per batch during ingestion.
+    ingest_batch_size: int = 512
+    # Extra comma-separated globs (relative to data_dir) to keep out of the index.
+    excluded_globs: str = ""
 
     # Tool calling
     max_tool_iterations: int = 4

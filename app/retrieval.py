@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
 import chromadb
 
+from . import documents
 from .config import Settings
 from .embeddings import Embedder, get_embedder
 
-SUPPORTED_SUFFIXES = (".md", ".txt")
+logger = logging.getLogger(__name__)
+
+SUPPORTED_SUFFIXES = documents.SUPPORTED_SUFFIXES
 
 
 def chunk_text(text: str, size: int, overlap: int) -> list[str]:
@@ -55,6 +59,7 @@ class Retriever:
         self._client = chromadb.PersistentClient(path=settings.chroma_dir)
         self._embedder: Embedder | None = None
         self._manifest_path = Path(settings.chroma_dir) / "manifest.json"
+        self._sources: list[str] | None = None
 
     @property
     def embedder(self) -> Embedder:
@@ -71,19 +76,27 @@ class Retriever:
 
     def _corpus(self) -> list[Path]:
         root = Path(self.settings.data_dir)
-        files = [path for path in sorted(root.rglob("*")) if path.suffix in SUPPORTED_SUFFIXES and path.is_file()]
-        return [path for path in files if Path(self.settings.chroma_dir) not in path.parents]
+        chroma = Path(self.settings.chroma_dir)
+        excludes = documents.DEFAULT_EXCLUDES + tuple(
+            pattern.strip() for pattern in self.settings.excluded_globs.split(",") if pattern.strip()
+        )
+        files = [path for path in sorted(root.rglob("*")) if documents.is_indexable(path, root, excludes)]
+        return [path for path in files if chroma not in path.parents]
 
     def _fingerprint(self, files: list[Path]) -> str:
         digest = hashlib.sha256()
-        digest.update(f"{self.embedder.name}|{self.settings.chunk_size_words}|{self.settings.chunk_overlap_words}".encode())
+        digest.update(
+            f"{self.embedder.name}|{self.settings.chunk_size_words}|{self.settings.chunk_overlap_words}"
+            f"|extractor={documents.EXTRACTOR_VERSION}".encode()
+        )
         for path in files:
-            digest.update(path.name.encode())
+            digest.update(str(path.relative_to(self.settings.data_dir)).encode())
             digest.update(hashlib.sha256(path.read_bytes()).digest())
         return digest.hexdigest()
 
     def ingest(self, force: bool = False) -> tuple[int, int]:
         """(Re)build the index. Unchanged corpora skip re-embedding entirely."""
+        self._sources = None
         files = self._corpus()
         fingerprint = self._fingerprint(files)
 
@@ -95,16 +108,30 @@ class Retriever:
         texts: list[str] = []
         ids: list[str] = []
         metadatas: list[dict[str, Any]] = []
+        root = Path(self.settings.data_dir)
         for path in files:
-            chunks = chunk_text(
-                path.read_text(encoding="utf-8"),
-                self.settings.chunk_size_words,
-                self.settings.chunk_overlap_words,
-            )
-            for chunk_id, chunk in enumerate(chunks):
-                ids.append(f"{path.relative_to(self.settings.data_dir)}::{chunk_id}")
-                texts.append(chunk)
-                metadatas.append({"document": path.name, "chunk_id": chunk_id})
+            relative = path.relative_to(root).as_posix()
+            # The first path component names the corpus a chunk came from, so a
+            # caller can tell a CPython manual page from a project note.
+            parts = path.relative_to(root).parts
+            source = parts[0] if len(parts) > 1 else "root"
+            document = documents.load(path)
+            chunk_id = 0
+            for section in document.sections:
+                for chunk in chunk_text(section.text, self.settings.chunk_size_words, self.settings.chunk_overlap_words):
+                    ids.append(f"{relative}::{chunk_id}")
+                    texts.append(chunk)
+                    metadatas.append(
+                        {
+                            "document": relative,
+                            "chunk_id": chunk_id,
+                            "title": document.title,
+                            "section": section.heading,
+                            "anchor": section.anchor,
+                            "source": source,
+                        }
+                    )
+                    chunk_id += 1
 
         # A full rebuild is the honest way to honour deletions and edited chunks.
         try:
@@ -113,16 +140,18 @@ class Retriever:
             pass
         collection = self._collection()
 
-        if texts:
-            embeddings = self.embedder.embed_documents(texts)
-            for start in range(0, len(texts), 256):
-                stop = start + 256
-                collection.upsert(
-                    ids=ids[start:stop],
-                    documents=texts[start:stop],
-                    embeddings=embeddings[start:stop],
-                    metadatas=metadatas[start:stop],
-                )
+        # Embed and write one batch at a time: a 16k-chunk corpus held as Python
+        # float lists all at once costs far more memory than the vectors do.
+        batch = max(1, self.settings.ingest_batch_size)
+        for start in range(0, len(texts), batch):
+            stop = start + batch
+            collection.upsert(
+                ids=ids[start:stop],
+                documents=texts[start:stop],
+                embeddings=self.embedder.embed_documents(texts[start:stop]),
+                metadatas=metadatas[start:stop],
+            )
+            logger.info("indexed %d/%d chunks", min(stop, len(texts)), len(texts))
 
         self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self._manifest_path.write_text(
@@ -130,7 +159,7 @@ class Retriever:
         )
         return len(files), len(texts)
 
-    def search(self, query: str, limit: int | None = None) -> list[dict[str, Any]]:
+    def search(self, query: str, limit: int | None = None, source: str | None = None) -> list[dict[str, Any]]:
         collection = self._collection()
         if collection.count() == 0:
             self.ingest()
@@ -143,6 +172,7 @@ class Retriever:
             query_embeddings=[self.embedder.embed_query(query)],
             n_results=min(limit, collection.count()),
             include=["documents", "metadatas", "distances"],
+            where={"source": source} if source else None,
         )
 
         matches: list[dict[str, Any]] = []
@@ -154,9 +184,27 @@ class Retriever:
                     # Chroma returns cosine distance; report similarity instead.
                     "score": round(1.0 - float(distance), 4),
                     "text": text,
+                    "title": str(metadata.get("title", "")),
+                    "section": str(metadata.get("section", "")),
+                    "anchor": str(metadata.get("anchor", "")),
+                    "source": str(metadata.get("source", "root")),
                 }
             )
         return matches
+
+    def sources(self) -> list[str]:
+        """Distinct corpora present in the index.
+
+        Reading every metadata row is a full scan of a 16k-chunk collection, so
+        the answer is memoised and only recomputed when the index is rebuilt.
+        """
+        if self._sources is None:
+            try:
+                metadatas = self._collection().get(include=["metadatas"])["metadatas"]
+                self._sources = sorted({str(item.get("source", "root")) for item in metadatas or []})
+            except Exception:
+                return []
+        return self._sources
 
     def stats(self) -> dict[str, Any]:
         return {

@@ -83,7 +83,12 @@ if question := st.chat_input("Ask about the system, or try: what is 128 * 47?"):
         if payload["sources"]:
             with st.expander(f"Sources ({len(payload['sources'])})"):
                 for source in payload["sources"]:
-                    st.markdown(f"**{source['document']}** · chunk {source['chunk_id']} · similarity {source['score']:.3f}")
+                    # A CPython page is worth naming by its section, not its chunk number.
+                    where = source["document"] + (f"#{source['anchor']}" if source.get("anchor") else "")
+                    heading = source.get("section") or source.get("title") or ""
+                    st.markdown(f"**{where}** · chunk {source['chunk_id']} · similarity {source['score']:.3f}")
+                    if heading:
+                        st.caption(heading)
                     st.write(source["text"])
 
         st.session_state.messages.append({"role": "assistant", "content": payload["answer"], "meta": meta})

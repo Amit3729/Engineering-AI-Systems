@@ -31,15 +31,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "search_knowledge_base",
             "description": (
-                "Semantic search over the ingested engineering documents. Call this "
-                "whenever the question could be answered by project documentation, and "
-                "call it again with a reworded query if the first results look thin."
+                "Semantic search over the indexed corpora: the project's own engineering "
+                "notes and the full CPython 3.14 documentation. Call this whenever the "
+                "question could be answered by documentation, and call it again with a "
+                "reworded query if the first results look thin."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural-language search query."},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "description": "How many chunks to return."},
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "Restrict the search to one corpus: 'python-3.14-docs-html' for the "
+                            "CPython manual, 'root' for the project's own notes. Omit to search all."
+                        ),
+                    },
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -115,8 +123,8 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return TOOL_SCHEMAS
 
-    def _search(self, query: str, top_k: int = 4) -> dict[str, Any]:
-        matches = self._retriever.search(query, limit=max(1, min(int(top_k), 10)))
+    def _search(self, query: str, top_k: int = 4, source: str | None = None) -> dict[str, Any]:
+        matches = self._retriever.search(query, limit=max(1, min(int(top_k), 10)), source=source or None)
         return {"query": query, "matches": matches}
 
     async def execute(self, name: str, raw_arguments: str) -> tuple[str, dict[str, Any] | None]:

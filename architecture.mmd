@@ -17,14 +17,15 @@ flowchart TB
         direction TB
         Embed["Embeddings<br/>ONNX Runtime · bge-small-en-v1.5 · 384d<br/>(openai | hash alternatives)"]
         Chroma[("ChromaDB<br/>persistent · HNSW · cosine")]
-        Ingest["Ingestion<br/>paragraph-aware chunks<br/>180 words / 40 overlap<br/>fingerprint skips unchanged corpus"]
-        Docs[/"data/*.md, *.txt"/] --> Ingest --> Embed --> Chroma
+        Parse["Document parsing<br/>Sphinx HTML → sections (id + heading trail)<br/>signatures and code blocks kept verbatim<br/>build artefacts excluded"]
+        Ingest["Ingestion<br/>section-scoped chunks, 180 words / 40 overlap<br/>batched embed + upsert<br/>fingerprint skips unchanged corpus"]
+        Docs[/"data/*.md, *.txt<br/>data/python-3.14-docs-html/**.html<br/>545 files → ~16k chunks"/] --> Parse --> Ingest --> Embed --> Chroma
         Embed --> Chroma
     end
 
     subgraph Tools["Allow-listed tools"]
         direction TB
-        T1["search_knowledge_base"]
+        T1["search_knowledge_base<br/>query · top_k · source filter"]
         T2["calculator<br/>restricted AST"]
         T3["current_time"]
     end
