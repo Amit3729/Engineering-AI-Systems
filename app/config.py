@@ -7,7 +7,8 @@ load_dotenv()  # Load environment variables from .env file
 
 
 class Settings(BaseSettings):
-    # Generation provider: "local" (no key, deterministic demo), "openai", or "vllm".
+    # Generation provider: "local" (no key, deterministic demo), "openai", "vllm",
+    # or "ollama" (a local model, no key and no cost).
     provider: str = "local"
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_model: str = "gpt-4o-mini"
@@ -16,6 +17,9 @@ class Settings(BaseSettings):
     fallback_model: str = "gpt-4o-mini"
     vllm_base_url: str = "http://vllm:8000/v1"
     vllm_model: str = "meta-llama/Llama-3.2-3B-Instruct"
+    # Ollama speaks the OpenAI protocol on /v1, so it needs no separate adapter.
+    ollama_base_url: str = "http://localhost:11434/v1"
+    ollama_model: str = "qwen2.5:7b"
 
     # Embeddings: "onnx" (ONNX Runtime, no API key), "openai", or "hash" (test double).
     embedding_provider: str = "onnx"
@@ -40,6 +44,23 @@ class Settings(BaseSettings):
 
     # Tool calling
     max_tool_iterations: int = 4
+
+    # Agentic pattern: "single" is the W15 tool-calling loop; "multi" adds a
+    # planner, parallel researchers with isolated context, and a synthesiser.
+    agent_mode: str = "single"
+    max_researchers: int = 3
+    # 3 turns = two search rounds plus a forced report. Two turns would allow
+    # only one search, which is also one too few for compaction to ever fire.
+    researcher_max_iterations: int = 3
+    researcher_top_k: int = 5
+    # Retrieval payloads older than this many tool results are compacted to
+    # citations only, so a researcher's window does not fill with raw chunks.
+    compaction_keep_raw: int = 1
+
+    # Deliberate fault for the failure-injection test. One of "", "tool_unavailable",
+    # "malformed_retrieval", "retrieval_timeout".
+    fault_injection: str = ""
+    tool_timeout_seconds: float = 20.0
 
     # Reliability / performance
     request_timeout_seconds: float = 30.0

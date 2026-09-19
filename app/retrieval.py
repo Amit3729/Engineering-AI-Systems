@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 SUPPORTED_SUFFIXES = documents.SUPPORTED_SUFFIXES
 
 
+def corrupt_matches() -> list[dict[str, Any]]:
+    """Retrieval output with the contract broken: no text, no usable metadata."""
+    return [
+        {"document": "\ufffd\ufffd\ufffd", "chunk_id": -1, "score": 0.0, "text": "\ufffd\ufffd<<truncated>>\ufffd",
+         "title": "", "section": "", "anchor": "", "source": ""},
+        {"document": "", "chunk_id": -1, "score": 0.0, "text": "", "title": "", "section": "", "anchor": "", "source": ""},
+    ]
+
+
 def chunk_text(text: str, size: int, overlap: int) -> list[str]:
     """Pack paragraphs into word-bounded chunks with a sliding overlap.
 
@@ -153,13 +162,30 @@ class Retriever:
             )
             logger.info("indexed %d/%d chunks", min(stop, len(texts)), len(texts))
 
+        self._sources = sorted({str(metadata["source"]) for metadata in metadatas})
         self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self._manifest_path.write_text(
-            json.dumps({"fingerprint": fingerprint, "documents": len(files), "chunks": len(texts), "embedder": self.embedder.name})
+            json.dumps(
+                {
+                    "fingerprint": fingerprint,
+                    "documents": len(files),
+                    "chunks": len(texts),
+                    "embedder": self.embedder.name,
+                    "sources": self._sources,
+                }
+            )
         )
         return len(files), len(texts)
 
     def search(self, query: str, limit: int | None = None, source: str | None = None) -> list[dict[str, Any]]:
+        # Injected faults live here rather than in the tool, so that the API's
+        # pre-retrieval degrades with the tool instead of quietly compensating
+        # for it. A fault that only half the system sees is not a useful test.
+        if self.settings.fault_injection == "retrieval_timeout":
+            raise TimeoutError("vector search did not return in time")
+        if self.settings.fault_injection == "malformed_retrieval":
+            return corrupt_matches()
+
         collection = self._collection()
         if collection.count() == 0:
             self.ingest()
@@ -195,15 +221,23 @@ class Retriever:
     def sources(self) -> list[str]:
         """Distinct corpora present in the index.
 
-        Reading every metadata row is a full scan of a 16k-chunk collection, so
-        the answer is memoised and only recomputed when the index is rebuilt.
+        Ingestion already knows the answer, so it is written to the manifest.
+        The scan below is only for an index built before that was recorded, and
+        it is a full pass over every metadata row - too slow to run per request,
+        hence the memo.
         """
-        if self._sources is None:
-            try:
-                metadatas = self._collection().get(include=["metadatas"])["metadatas"]
-                self._sources = sorted({str(item.get("source", "root")) for item in metadatas or []})
-            except Exception:
-                return []
+        if self._sources is not None:
+            return self._sources
+        try:
+            if self._manifest_path.exists():
+                recorded = json.loads(self._manifest_path.read_text()).get("sources")
+                if recorded is not None:
+                    self._sources = [str(item) for item in recorded]
+                    return self._sources
+            metadatas = self._collection().get(include=["metadatas"])["metadatas"]
+            self._sources = sorted({str(item.get("source", "root")) for item in metadatas or []})
+        except Exception:
+            return []
         return self._sources
 
     def stats(self) -> dict[str, Any]:

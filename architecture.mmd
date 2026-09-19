@@ -1,26 +1,48 @@
 flowchart TB
     User([User]) --> UI["Streamlit UI<br/>:8501"]
-    UI -->|"POST /chat"| API
+    UI -->|"POST /chat { question, mode }"| API
 
     subgraph API["FastAPI service :8000"]
         direction TB
         RL["Rate limiter<br/>sliding window per IP → 429 + Retry-After"]
-        Cache["Bounded TTL + LRU response cache<br/>key = question + temperature + top_p"]
+        Cache["Bounded TTL + LRU response cache<br/>key = question + temperature + top_p + mode"]
         Pre["Pre-retrieval<br/>top-k chunks above min_score"]
-        Loop["Tool-calling loop<br/>bounded iterations, tools off on final turn"]
-        Merge["Merge + de-duplicate sources<br/>structured JSON response"]
-        RL --> Cache -->|miss| Pre --> Loop --> Merge
+        Route{"agent_mode"}
+        Merge["Merge + de-duplicate sources<br/>structured JSON + usage + trajectory"]
+        RL --> Cache -->|miss| Pre --> Route
         Cache -->|hit| Merge
+    end
+
+    subgraph Single["Single-agent loop (W15 baseline)"]
+        direction TB
+        Loop["Tool-calling loop<br/>≤ max_tool_iterations<br/>tools off on the final turn<br/>every tool result kept verbatim"]
+    end
+
+    subgraph Multi["Multi-agent research team (W16)"]
+        direction TB
+        Plan["Planner<br/>splits the question into ≤ 3 independent lookups<br/>picks a corpus per lookup<br/>needs_research = false → hand back to the single loop"]
+        R1["Researcher 1<br/>own message list<br/>search → compact → digest"]
+        R2["Researcher 2<br/>own message list"]
+        R3["Researcher 3<br/>own message list"]
+        Synth["Synthesiser<br/>writes the answer from findings only<br/>calculator + current_time, no search"]
+        Plan -->|"fan out, asyncio.gather"| R1 & R2 & R3
+        R1 & R2 & R3 -->|"COMPACTION BOUNDARY<br/>(claim, citation) findings only —<br/>chunk text never crosses"| Synth
+    end
+
+    subgraph Compact["Compaction inside a researcher"]
+        direction TB
+        C1["newest tool result: full chunk text"]
+        C2["older tool results: rewritten to<br/>{ query, documents[] } — text dropped"]
+        C1 -.->|"on the next turn"| C2
     end
 
     subgraph RAG["Retrieval"]
         direction TB
-        Embed["Embeddings<br/>ONNX Runtime · bge-small-en-v1.5 · 384d<br/>(openai | hash alternatives)"]
-        Chroma[("ChromaDB<br/>persistent · HNSW · cosine")]
-        Parse["Document parsing<br/>Sphinx HTML → sections (id + heading trail)<br/>signatures and code blocks kept verbatim<br/>build artefacts excluded"]
+        Embed["Embeddings<br/>ONNX Runtime · bge-small-en-v1.5 · 384d<br/>batch 32<br/>(openai | hash alternatives)"]
+        Chroma[("ChromaDB<br/>persistent · HNSW · cosine<br/>13,657 chunks")]
+        Parse["Document parsing<br/>Sphinx HTML → sections (id + heading trail)<br/>signatures and code blocks kept verbatim<br/>build artefacts, redirect stubs and the<br/>2,878-chunk changelog excluded"]
         Ingest["Ingestion<br/>section-scoped chunks, 180 words / 40 overlap<br/>batched embed + upsert<br/>fingerprint skips unchanged corpus"]
-        Docs[/"data/*.md, *.txt<br/>data/python-3.14-docs-html/**.html<br/>545 files → ~16k chunks"/] --> Parse --> Ingest --> Embed --> Chroma
-        Embed --> Chroma
+        Docs[/"data/*.md (project notes)<br/>data/python-3.14-docs-html/**.html<br/>544 files after exclusions"/] --> Parse --> Ingest --> Embed --> Chroma
     end
 
     subgraph Tools["Allow-listed tools"]
@@ -28,18 +50,37 @@ flowchart TB
         T1["search_knowledge_base<br/>query · top_k · source filter"]
         T2["calculator<br/>restricted AST"]
         T3["current_time"]
+        Fault["Fault injection<br/>tool_unavailable · malformed_retrieval · retrieval_timeout<br/>+ per-call timeout"]
     end
 
     subgraph Providers["Generation (OpenAI-compatible)"]
         direction TB
-        Primary["Primary<br/>openai | vllm | local"]
+        Primary["Primary<br/>ollama | openai | vllm | local"]
         Fallback["Fallback provider"]
         Primary -->|"retry: backoff + jitter<br/>then fail over"| Fallback
     end
 
+    subgraph Eval["Evaluation harness (eval/)"]
+        direction TB
+        Cases["20 cases<br/>single_hop · multi_hop · arithmetic · unanswerable"]
+        Score["Scoring<br/>completion · tool-call validity vs JSON schema<br/>trajectory length · tokens per query"]
+        Taxon["Failure log<br/>hard · soft · cascading soft"]
+        Cases --> Score --> Taxon --> Report[/"eval/results/report.md<br/>results.json"/]
+    end
+
+    Route -->|"single"| Loop
+    Route -->|"multi"| Plan
+    Loop --> Merge
+    Synth --> Merge
     Pre --> Chroma
     Loop <-->|"tool_calls / tool results"| Tools
+    R1 & R2 & R3 <-->|"search_knowledge_base only"| Tools
+    Synth <-->|"calculator · current_time"| Tools
+    R1 -.-> Compact
     T1 --> Chroma
+    Fault -.->|"degrades"| T1
     Loop <-->|"chat.completions<br/>tools + response_format=json_object"| Providers
+    Plan & R1 & R2 & R3 & Synth <-->|"LLMService.call()<br/>shared retry + fail-over + token accounting"| Providers
     Primary -.-> vLLM["vLLM server :8001<br/>Llama 3 / Mistral<br/>paged attention + continuous batching"]
     Merge --> UI
+    Eval -.->|"drives both modes,<br/>bypasses cache + rate limiter"| Route

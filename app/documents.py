@@ -41,6 +41,13 @@ DEFAULT_EXCLUDES = (
     "license.html",
     "copyright.html",
     "improve-page*.html",
+    # The per-bug changelog is 2,878 chunks - 17% of the whole index - of lines
+    # like "gh-12345: Fix a crash in json.dumps()". Those fragments match almost
+    # any "how does X work" question on surface wording and crowd out the
+    # reference page that actually answers it: before this exclusion, a query
+    # about json.dumps ranked the changelog above library/json.html. The
+    # narrative whatsnew/3.x.html pages are kept; they are real documentation.
+    "whatsnew/changelog.html",
 )
 
 # Chrome that lives inside the main content area of a Sphinx page.
@@ -72,11 +79,20 @@ class Document:
 
 
 def is_indexable(path: Path, root: Path, excludes: tuple[str, ...] = DEFAULT_EXCLUDES) -> bool:
-    """Should this file go into the index?"""
+    """Should this file go into the index?
+
+    A pattern matches anywhere under the root, not only directly beneath it: the
+    CPython build sits in its own directory, so an exclude written as
+    ``whatsnew/changelog.html`` has to match
+    ``python-3.14-docs-html/whatsnew/changelog.html`` too.
+    """
     if not path.is_file() or path.suffix not in SUPPORTED_SUFFIXES:
         return False
     relative = path.relative_to(root).as_posix()
-    return not any(fnmatch(relative, pattern) or fnmatch(path.name, pattern) for pattern in excludes)
+    return not any(
+        fnmatch(relative, pattern) or fnmatch(relative, f"*/{pattern}") or fnmatch(path.name, pattern)
+        for pattern in excludes
+    )
 
 
 def _clean(text: str) -> str:

@@ -87,6 +87,23 @@ class ToolError(Exception):
     """Raised for a bad call; surfaced to the model so it can correct itself."""
 
 
+def _error(message: str, kind: str) -> str:
+    """A tool failure, labelled with whose fault it was.
+
+    ``kind="arguments"`` means the model asked for something invalid and could
+    fix it by asking differently. ``kind="infrastructure"`` means the tool itself
+    is broken or withdrawn and no rewording will help. Evaluation needs the
+    distinction: a calculator rejecting "next Tuesday" says something about the
+    agent, a vector search timing out does not.
+    """
+    return json.dumps({"error": message, "kind": kind})
+
+
+# Faults the harness can switch on to check that the assistant notices broken
+# evidence instead of answering confidently from it.
+FAULTS = ("tool_unavailable", "malformed_retrieval", "retrieval_timeout")
+
+
 def calculator(expression: str) -> float:
     def evaluate(node: ast.AST) -> float:
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
@@ -111,8 +128,11 @@ def calculator(expression: str) -> float:
 class ToolRegistry:
     """Binds tool names to implementations, with the retriever injected."""
 
-    def __init__(self, retriever: Any):
+    def __init__(self, retriever: Any, settings: Any | None = None):
         self._retriever = retriever
+        self._settings = settings
+        self._fault = getattr(settings, "fault_injection", "") or ""
+        self._timeout = float(getattr(settings, "tool_timeout_seconds", 20.0))
         self._handlers: dict[str, Callable[..., Any]] = {
             "search_knowledge_base": self._search,
             "calculator": lambda expression: {"expression": expression, "result": calculator(expression)},
@@ -121,9 +141,14 @@ class ToolRegistry:
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
+        if self._fault == "tool_unavailable":
+            # The model is never told the tool exists, so a graceful answer has
+            # to come from admitting the gap rather than from a failed call.
+            return [schema for schema in TOOL_SCHEMAS if schema["function"]["name"] != "search_knowledge_base"]
         return TOOL_SCHEMAS
 
     def _search(self, query: str, top_k: int = 4, source: str | None = None) -> dict[str, Any]:
+        # Retrieval faults are injected in the Retriever, which this calls into.
         matches = self._retriever.search(query, limit=max(1, min(int(top_k), 10)), source=source or None)
         return {"query": query, "matches": matches}
 
@@ -135,19 +160,25 @@ class ToolRegistry:
         """
         handler = self._handlers.get(name)
         if handler is None:
-            return json.dumps({"error": f"Unknown tool '{name}'"}), None
+            return _error(f"Unknown tool '{name}'", "arguments"), None
+        if self._fault == "tool_unavailable" and name == "search_knowledge_base":
+            return _error("Tool 'search_knowledge_base' is unavailable", "infrastructure"), None
 
         try:
             arguments = json.loads(raw_arguments or "{}")
             if not isinstance(arguments, dict):
                 raise ToolError("Tool arguments must be a JSON object")
-            result = await asyncio.to_thread(handler, **arguments)
+            result = await asyncio.wait_for(asyncio.to_thread(handler, **arguments), timeout=self._timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            # Say what failed. A silent empty result reads to the model like
+            # "nothing was found", which is exactly the wrong inference.
+            return _error(f"Tool '{name}' timed out after {self._timeout:g}s; no results were retrieved", "infrastructure"), None
         except ToolError as error:
-            return json.dumps({"error": str(error)}), None
+            return _error(str(error), "arguments"), None
         except (json.JSONDecodeError, TypeError) as error:
-            return json.dumps({"error": f"Invalid arguments for '{name}': {error}"}), None
+            return _error(f"Invalid arguments for '{name}': {error}", "arguments"), None
         except Exception as error:  # a failing tool must not fail the request
-            return json.dumps({"error": f"Tool '{name}' failed: {error}"}), None
+            return _error(f"Tool '{name}' failed: {error}", "infrastructure"), None
 
         matches = result.get("matches") if name == "search_knowledge_base" else None
         return json.dumps(result, default=str), matches
